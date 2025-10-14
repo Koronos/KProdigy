@@ -81,10 +81,12 @@ class KProdigy(torch.optim.Optimizer):
             Enable multi-tensor operations for GPU speedup (~21% faster).
             Auto-falls back to CPU if needed.
             Default: True
-        independent_d (bool):
-            Calculate separate D estimates per parameter group.
-            Essential for multi-component models (e.g., SDXL with UNet + Text Encoders).
-            Default: False
+            
+    Note:
+        independent_d is automatically inferred based on the number of parameter groups.
+        If multiple parameter groups are detected, D estimation is calculated independently
+        for each group to prevent issues like "burning" sensitive components in multi-component
+        models (e.g., SDXL UNet + Text Encoder).
     """
     
     def __init__(
@@ -103,8 +105,7 @@ class KProdigy(torch.optim.Optimizer):
         growth_rate: float = float('inf'),
         fsdp_in_use: bool = False,
         slice_p: int = 1,
-        foreach: bool = True,
-        independent_d: bool = False
+        foreach: bool = True
     ):
         if not 0.0 < d0:
             raise ValueError(f"Invalid d0 value: {d0}")
@@ -140,12 +141,17 @@ class KProdigy(torch.optim.Optimizer):
             safeguard_warmup=safeguard_warmup,
             fsdp_in_use=fsdp_in_use,
             slice_p=slice_p,
-            foreach=foreach,
-            independent_d=independent_d
+            foreach=foreach
         )
         
         self.d0 = d0
         super().__init__(params, defaults)
+        
+        # Cache for CUDA availability check (Hot Path Optimization #1)
+        self._can_use_foreach = None
+        
+        # Cache for independent_d decision (inferred once, never recalculated)
+        self._use_independent_d = len(self.param_groups) > 1
         
         self._detect_fsdp()
 
@@ -167,6 +173,37 @@ class KProdigy(torch.optim.Optimizer):
     def supports_flat_params(self) -> bool:
         return True
 
+    def _compute_bias_correction(self, use_bias_correction: bool, beta2: float, beta1: float, 
+                                 k: int, d: float, d0: float) -> float:
+        """Compute adaptive bias correction for improved stability."""
+        if use_bias_correction:
+            bias_correction = ((1 - beta2**(k+1))**0.5) / (1 - beta1**(k+1))
+            # Adaptive bias correction: more conservative initially
+            scale_factor = min(max(d / d0, 0.1), 1.0)
+            bias_correction *= scale_factor
+        else:
+            bias_correction = 1.0
+        return bias_correction
+    
+    def _get_group_hyperparams(self, group: dict) -> Tuple[bool, float, float, float]:
+        """Extract and normalize hyperparameters from parameter group."""
+        use_bias_correction = group['use_bias_correction']
+        beta1, beta2 = group['betas']
+        beta3 = group['beta3']
+        if beta3 is None:
+            beta3 = math.sqrt(beta2)
+        return use_bias_correction, beta1, beta2, beta3
+    
+    def _precompute_scalars(self, d: float, d0: float, dlr: float, beta1: float, beta2: float) -> dict:
+        """Pre-compute scalar multipliers to avoid repeated calculations."""
+        return {
+            'd_over_d0': d / d0,
+            'dlr_scaled': (d / d0) * dlr,
+            'dlr_scaled_d': (d / d0) * d,
+            'beta1_complement': 1.0 - beta1,
+            'beta2_complement': 1.0 - beta2
+        }
+
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
         """Performs a single optimization step."""
@@ -175,23 +212,25 @@ class KProdigy(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        group = self.param_groups[0]
-        independent_d = group.get('independent_d', False)
-        
-        if independent_d and len(self.param_groups) > 1:
+        # Use cached independent_d decision (inferred once in __init__)
+        if self._use_independent_d:
             return self._step_independent_d(closure, loss)
+        
+        group = self.param_groups[0]
         
         foreach = group.get('foreach', True)
         
+        # Cache CUDA check on first step to avoid repeated overhead (Hot Path Opt #1)
         if foreach:
-            can_use_foreach = all(
-                p.is_cuda 
-                for grp in self.param_groups 
-                for p in grp['params'] 
-                if p.grad is not None
-            )
-            if not can_use_foreach:
-                foreach = False
+            if self._can_use_foreach is None:
+                # Only check once - this is expensive
+                self._can_use_foreach = all(
+                    p.is_cuda 
+                    for grp in self.param_groups 
+                    for p in grp['params'] 
+                    if p.grad is not None
+                )
+            foreach = self._can_use_foreach
 
         if foreach:
             return self._step_foreach(closure, loss)
@@ -203,27 +242,15 @@ class KProdigy(torch.optim.Optimizer):
         d_denom = 0.0
 
         group = self.param_groups[0]
-        use_bias_correction = group['use_bias_correction']
-        beta1, beta2 = group['betas']
-        beta3 = group['beta3']
-        if beta3 is None:
-            beta3 = math.sqrt(beta2)
+        use_bias_correction, beta1, beta2, beta3 = self._get_group_hyperparams(group)
         k = group['k']
-
         d = group['d']
         d_max = group['d_max']
         d_coef = group['d_coef']
         d0 = group['d0']
         lr = max(group['lr'] for group in self.param_groups)
 
-        if use_bias_correction:
-            bias_correction = ((1 - beta2**(k+1))**0.5) / (1 - beta1**(k+1))
-            # Adaptive bias correction for improved stability
-            scale_factor = min(max(d / d0, 0.1), 1.0)
-            bias_correction *= scale_factor
-        else:
-            bias_correction = 1.0
-
+        bias_correction = self._compute_bias_correction(use_bias_correction, beta2, beta1, k, d, d0)
         dlr = d * lr * bias_correction
        
         growth_rate = group['growth_rate']
@@ -233,6 +260,17 @@ class KProdigy(torch.optim.Optimizer):
         d_numerator = group['d_numerator']
         d_numerator *= beta3
         delta_numerator = 0.0
+        
+        # Pre-calculate scalar multipliers (Hot Path Optimization #2-4)
+        scalars = self._precompute_scalars(d, d0, dlr, beta1, beta2)
+        d_over_d0 = scalars['d_over_d0']
+        dlr_scaled = scalars['dlr_scaled']
+        dlr_scaled_d = scalars['dlr_scaled_d']
+        beta1_complement = scalars['beta1_complement']
+        beta2_complement = scalars['beta2_complement']
+        
+        # Optimization #6: Pre-create eps tensor (reused in second pass)
+        eps_tensor = None
 
         # First pass: compute D estimate and update EMA
         for group in self.param_groups:
@@ -264,13 +302,16 @@ class KProdigy(torch.optim.Optimizer):
                 if 'step' not in state:
                     state['step'] = 0
                     
+                    # Optimization #5: Calculate sliced param once
+                    sliced_param = p.data.flatten()[::slice_p]
+                    
                     state['s'] = torch.zeros_like(
-                        p.data.flatten()[::slice_p],
+                        sliced_param,
                         memory_format=torch.preserve_format
                     ).detach()
 
-                    if p.data.flatten()[::slice_p].norm() > 0:
-                        state['p0'] = p.data.flatten()[::slice_p].detach().clone()
+                    if sliced_param.norm() > 0:
+                        state['p0'] = sliced_param.detach().clone()
                     else:
                         state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
 
@@ -293,21 +334,26 @@ class KProdigy(torch.optim.Optimizer):
                     sliced_grad = grad.flatten()[::slice_p]
                     sliced_p = p.data.flatten()[::slice_p]
                     
-                    delta_numerator += (d / d0) * dlr * torch.dot(
+                    # Use pre-calculated dlr_scaled
+                    delta_numerator += dlr_scaled * torch.dot(
                         sliced_grad,
                         p0.data - sliced_p
                     ).item()
 
                     if beta1 > 0:
                         exp_avg = state['exp_avg']
-                        exp_avg.mul_(beta1).add_(grad, alpha=(1 - beta1))
+                        # Original Prodigy: scale by d
+                        exp_avg.mul_(beta1).add_(grad, alpha=d * beta1_complement)
                     
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+                    # Original Prodigy: scale by d²
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=d * d * beta2_complement)
 
                     if safeguard_warmup:
-                        s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * d))
+                        # Use pre-calculated dlr_scaled_d
+                        s.mul_(beta3).add_(sliced_grad, alpha=dlr_scaled_d)
                     else:
-                        s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * dlr))
+                        # Use pre-calculated dlr_scaled
+                        s.mul_(beta3).add_(sliced_grad, alpha=dlr_scaled)
                     
                     d_denom += s.abs().sum().item()
 
@@ -360,10 +406,11 @@ class KProdigy(torch.optim.Optimizer):
 
                 state['step'] += 1
 
-                denom = torch.maximum(
-                    exp_avg_sq.sqrt(),
-                    torch.tensor(eps, dtype=exp_avg_sq.dtype, device=exp_avg_sq.device)
-                )
+                # Optimization #6: Create eps_tensor once per group (Original Prodigy: d * eps)
+                if eps_tensor is None or eps_tensor.device != exp_avg_sq.device:
+                    eps_tensor = torch.tensor(d * eps, dtype=exp_avg_sq.dtype, device=exp_avg_sq.device)
+                
+                denom = torch.maximum(exp_avg_sq.sqrt(), eps_tensor)
 
                 if decay != 0 and decouple:
                     p.data.mul_(1 - decay * dlr)
@@ -387,26 +434,15 @@ class KProdigy(torch.optim.Optimizer):
         d_denom = 0.0
 
         group = self.param_groups[0]
-        use_bias_correction = group['use_bias_correction']
-        beta1, beta2 = group['betas']
-        beta3 = group['beta3']
-        if beta3 is None:
-            beta3 = math.sqrt(beta2)
+        use_bias_correction, beta1, beta2, beta3 = self._get_group_hyperparams(group)
         k = group['k']
-
         d = group['d']
         d_max = group['d_max']
         d_coef = group['d_coef']
         d0 = group['d0']
         lr = max(group['lr'] for group in self.param_groups)
 
-        if use_bias_correction:
-            bias_correction = ((1 - beta2**(k+1))**0.5) / (1 - beta1**(k+1))
-            scale_factor = min(max(d / d0, 0.1), 1.0)
-            bias_correction *= scale_factor
-        else:
-            bias_correction = 1.0
-
+        bias_correction = self._compute_bias_correction(use_bias_correction, beta2, beta1, k, d, d0)
         dlr = d * lr * bias_correction
        
         growth_rate = group['growth_rate']
@@ -416,6 +452,17 @@ class KProdigy(torch.optim.Optimizer):
         d_numerator = group['d_numerator']
         d_numerator *= beta3
         delta_numerator = 0.0
+        
+        # Pre-calculate scalar multipliers (Hot Path Optimization #2-4)
+        scalars = self._precompute_scalars(d, d0, dlr, beta1, beta2)
+        d_over_d0 = scalars['d_over_d0']
+        dlr_scaled = scalars['dlr_scaled']
+        dlr_scaled_d = scalars['dlr_scaled_d']
+        beta1_complement = scalars['beta1_complement']
+        beta2_complement = scalars['beta2_complement']
+        
+        # Optimization #6: Pre-create eps tensor
+        eps_tensor = None
 
         for group in self.param_groups:
             decay = group['weight_decay']
@@ -455,13 +502,16 @@ class KProdigy(torch.optim.Optimizer):
                 if 'step' not in state:
                     state['step'] = 0
                     
+                    # Optimization #5: Calculate sliced param once
+                    sliced_param = p.data.flatten()[::slice_p]
+                    
                     state['s'] = torch.zeros_like(
-                        p.data.flatten()[::slice_p],
+                        sliced_param,
                         memory_format=torch.preserve_format
                     ).detach()
 
-                    if p.data.flatten()[::slice_p].norm() > 0:
-                        state['p0'] = p.data.flatten()[::slice_p].detach().clone()
+                    if sliced_param.norm() > 0:
+                        state['p0'] = sliced_param.detach().clone()
                     else:
                         state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
 
@@ -489,26 +539,31 @@ class KProdigy(torch.optim.Optimizer):
                     sliced_grad = grad.flatten()[::slice_p]
                     sliced_p = p.data.flatten()[::slice_p]
                     
-                    delta_numerator += (d / d0) * dlr * torch.dot(
+                    # Use pre-calculated dlr_scaled
+                    delta_numerator += dlr_scaled * torch.dot(
                         sliced_grad,
                         p0.data - sliced_p
                     ).item()
 
                     if safeguard_warmup:
-                        s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * d))
+                        # Use pre-calculated dlr_scaled_d
+                        s.mul_(beta3).add_(sliced_grad, alpha=dlr_scaled_d)
                     else:
-                        s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * dlr))
+                        # Use pre-calculated dlr_scaled
+                        s.mul_(beta3).add_(sliced_grad, alpha=dlr_scaled)
                     
                     d_denom += s.abs().sum().item()
 
-            # Multi-tensor EMA updates
+            # Multi-tensor EMA updates with d-scaling (Original Prodigy)
             if len(grads) > 0:
                 if beta1 > 0 and len(exp_avgs) > 0:
                     torch._foreach_mul_(exp_avgs, beta1)
-                    torch._foreach_add_(exp_avgs, grads, alpha=(1 - beta1))
+                    # Original Prodigy: scale by d
+                    torch._foreach_add_(exp_avgs, grads, alpha=d * beta1_complement)
                 
                 torch._foreach_mul_(exp_avg_sqs, beta2)
-                torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=(1 - beta2))
+                # Original Prodigy: scale by d²
+                torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=d * d * beta2_complement)
 
         d_hat = d
 
@@ -570,7 +625,9 @@ class KProdigy(torch.optim.Optimizer):
                 # Batch sqrt operation
                 sqrts = torch._foreach_sqrt(exp_avg_sqs_update)
                 
-                eps_tensor = torch.tensor(eps, device=sqrts[0].device, dtype=sqrts[0].dtype)
+                # Optimization #6: Reuse eps_tensor if possible (Original Prodigy: d * eps)
+                if eps_tensor is None or eps_tensor.device != sqrts[0].device:
+                    eps_tensor = torch.tensor(d * eps, device=sqrts[0].device, dtype=sqrts[0].dtype)
                 denoms = [torch.maximum(sqrt, eps_tensor) for sqrt in sqrts]
 
                 if decay != 0 and decouple:
@@ -591,6 +648,9 @@ class KProdigy(torch.optim.Optimizer):
         Essential for multi-component models (e.g., SDXL with UNet + Text Encoders)
         to prevent "burning" sensitive components with mismatched learning rates.
         """
+        # Optimization #6: Pre-create eps tensor
+        eps_tensor = None
+        
         for group in self.param_groups:
             use_bias_correction = group['use_bias_correction']
             beta1, beta2 = group['betas']
@@ -641,13 +701,16 @@ class KProdigy(torch.optim.Optimizer):
                 if 'step' not in state:
                     state['step'] = 0
                     
+                    # Optimization #5: Calculate sliced param once
+                    sliced_param = p.data.flatten()[::slice_p]
+                    
                     state['s'] = torch.zeros_like(
-                        p.data.flatten()[::slice_p],
+                        sliced_param,
                         memory_format=torch.preserve_format
                     ).detach()
 
-                    if p.data.flatten()[::slice_p].norm() > 0:
-                        state['p0'] = p.data.flatten()[::slice_p].detach().clone()
+                    if sliced_param.norm() > 0:
+                        state['p0'] = sliced_param.detach().clone()
                     else:
                         state['p0'] = torch.tensor(0, device=p.device, dtype=p.dtype)
 
@@ -677,9 +740,11 @@ class KProdigy(torch.optim.Optimizer):
 
                     if beta1 > 0:
                         exp_avg = state['exp_avg']
-                        exp_avg.mul_(beta1).add_(grad, alpha=(1 - beta1))
+                        # Original Prodigy: scale by d
+                        exp_avg.mul_(beta1).add_(grad, alpha=d * (1 - beta1))
                     
-                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=(1 - beta2))
+                    # Original Prodigy: scale by d²
+                    exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=d * d * (1 - beta2))
 
                     if safeguard_warmup:
                         s.mul_(beta3).add_(sliced_grad, alpha=((d / d0) * d))
@@ -726,10 +791,11 @@ class KProdigy(torch.optim.Optimizer):
 
                 state['step'] += 1
 
-                denom = torch.maximum(
-                    exp_avg_sq.sqrt(),
-                    torch.tensor(eps, dtype=exp_avg_sq.dtype, device=exp_avg_sq.device)
-                )
+                # Optimization #6: Create eps_tensor once per group (Original Prodigy: d * eps)
+                if eps_tensor is None or eps_tensor.device != exp_avg_sq.device:
+                    eps_tensor = torch.tensor(d * eps, dtype=exp_avg_sq.dtype, device=exp_avg_sq.device)
+                
+                denom = torch.maximum(exp_avg_sq.sqrt(), eps_tensor)
 
                 if decay != 0 and decouple:
                     p.data.mul_(1 - decay * dlr)

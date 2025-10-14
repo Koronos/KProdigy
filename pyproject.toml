@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kprodigy"
-version = "0.1.0"
-description = "Enhanced Prodigy optimizer with ~21% GPU speedup and multi-component support"
+version = "0.2.0"
+description = "Enhanced Prodigy optimizer with auto-detected Independent D for SDXL multi-component training"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
