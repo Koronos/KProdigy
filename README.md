@@ -141,9 +141,16 @@ In multi-component models like SDXL:
 
 ## Citation
 
-If you use K-Prodigy in your research, please cite the original Prodigy paper:
+If you use K-Prodigy in your research, please cite both K-Prodigy and the original Prodigy paper:
 
 ```bibtex
+@software{kprodigy2025,
+  title={K-Prodigy: Enhanced Prodigy Optimizer with GPU Acceleration},
+  author={Koronos},
+  year={2025},
+  url={https://github.com/Koronos/KProdigy}
+}
+
 @article{mishchenko2023prodigy,
   title={Prodigy: An Expeditiously Adaptive Parameter-Free Learner},
   author={Mishchenko, Konstantin and Defazio, Aaron},
