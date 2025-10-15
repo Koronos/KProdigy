@@ -75,8 +75,8 @@ def test_kprodigy_performance():
         'lr': 1.0,
         'betas': (0.9, 0.99),
         'weight_decay': 0.01,
-        'use_bias_correction': True,
-        'foreach': True
+        'use_bias_correction': True
+        # Note: foreach is always enabled in v0.3.0
     }
     
     # Generate synthetic data
