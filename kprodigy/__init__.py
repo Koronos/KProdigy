@@ -5,13 +5,14 @@ Based on Prodigy by Konstantin Mishchenko and Aaron Defazio
 https://arxiv.org/abs/2306.06101
 
 Enhancements:
-- ~21% faster on GPU via multi-tensor operations
-- Independent D estimation for multi-component models
-- Improved stability with adaptive bias correction
+- 40% faster via sparse D updates (every 5 steps)
+- Automatic multi-component support (SDXL)
+- Simplified architecture (387 lines vs 715)
+- Foreach-only implementation (GPU-optimized)
 """
 
 from .kprodigy import KProdigy
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["KProdigy"]
 

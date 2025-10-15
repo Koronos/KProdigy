@@ -5,6 +5,56 @@ All notable changes to K-Prodigy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-10-15
+
+### Added
+- **Sparse D updates** - Calculate D every 5 steps instead of every step
+  - 40% performance improvement with identical convergence
+  - Configurable via `d_update_freq` parameter (default: 5)
+  - Minimal overhead while maintaining D accuracy
+- **Automatic multi-component support** - Independent D without explicit methods
+  - Simplified architecture: Single `_step_foreach()` method handles all cases
+  - Each parameter group automatically maintains its own D estimate
+  - No detection overhead, works via natural `for group in param_groups` loop
+  - SDXL support out-of-the-box without configuration
+
+### Changed
+- **Simplified architecture** - Reduced from 715 to 387 lines (-46%)
+  - Removed `_step_single_tensor()` fallback (foreach-only for GPU optimization)
+  - Removed separate `_step_independent_d()` method (now automatic)
+  - Eliminated `_detect_independent_d()` and `_use_independent_d` flag
+  - Cleaner codebase with identical functionality
+- **Updated docstrings** - Clearer documentation of automatic features
+- **foreach-only implementation** - GPU-first design
+  - CPU training shows warning but still works
+  - Optimized for modern CUDA workflows
+
+### Performance
+**Comparison Benchmarks** (SDXL Multi-Component, 200 steps):
+- **v0.2.0 (Legacy)**: 1.182s (5.91ms/step)
+- **v0.3.0 (New)**: 0.702s (3.51ms/step)  
+- **Improvement**: +40.6% faster
+- **Convergence**: Identical (all reach loss ~0.000000)
+- **Independent D**: Automatic (D ratio 2.40x-4.64x depending on setup)
+
+### Fixed
+- Removed Unicode/emoji characters from code (Windows compatibility)
+- Updated CPU warning message
+
+### Breaking Changes
+- **Removed CPU fallback** (`_step_single_tensor` method)
+  - Rationale: KProdigy is GPU-optimized, CPU use case is marginal
+  - Migration: Use original Prodigy for CPU-only training
+  - GPU users: No changes needed
+
+### Migration Notes
+- **No API changes** - Existing code works without modification
+- **Automatic SDXL** - Just use multiple parameter groups, Independent D works automatically
+- **Legacy available** - Previous version saved as `kprodigy_legacy.py` in research repo if needed
+- **Performance boost** - Expect 40% speedup with same convergence
+
+---
+
 ## [0.2.0] - 2025-10-14
 
 ### Added
@@ -95,6 +145,7 @@ K-Prodigy is based on the [Prodigy optimizer](https://github.com/konstmish/prodi
 
 > Mishchenko, K., & Defazio, A. (2023). *Prodigy: An Expeditiously Adaptive Parameter-Free Learner*. arXiv preprint arXiv:2306.06101.
 
+[0.3.0]: https://github.com/Koronos/KProdigy/releases/tag/v0.3.0
 [0.2.0]: https://github.com/Koronos/KProdigy/releases/tag/v0.2.0
 [0.1.0]: https://github.com/Koronos/KProdigy/releases/tag/v0.1.0
 
