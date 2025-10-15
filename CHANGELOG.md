@@ -5,6 +5,31 @@ All notable changes to K-Prodigy will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.4] - 2025-10-15
+
+### Added
+- **Experimental: Sparse D updates feature (`d_update_freq`)**
+  - Updates D estimation every N steps instead of every step
+  - Default `d_update_freq=5` for backward compatibility with legacy
+  - CPU benchmark shows 26% speedup with identical convergence
+  - Feature is functional but in testing phase
+
+### Changed
+- Updated to legacy-based implementation with `d_update_freq` integration
+- Reverted to proven stable architecture while adding performance optimization
+- More conservative approach prioritizing reliability
+
+### Status
+⚠️ **Development Phase**: This version integrates experimental features that are still being validated in real-world scenarios. While benchmarks show promising results, we recommend thorough testing before production use. The optimizer continues to be refined to achieve clear advantages over original Prodigy.
+
+### Migration Notes
+- Drop-in replacement for v0.3.3
+- `d_update_freq` parameter now available for performance tuning
+- Set `d_update_freq=1` for maximum accuracy (multi-component models)
+- Set `d_update_freq=5` for performance (~26% faster based on CPU tests)
+
+---
+
 ## [0.3.3] - 2025-10-15
 
 ### Fixed

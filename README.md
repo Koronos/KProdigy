@@ -6,6 +6,8 @@
 
 An enhanced version of the [Prodigy optimizer](https://github.com/konstmish/prodigy) with ~21% GPU speedup and multi-component model support.
 
+> ⚠️ **Development Status**: K-Prodigy is currently in active development and testing phase. We are continuously refining parameters and optimizations to achieve clear advantages over the original Prodigy in real-world scenarios. While functional, expect changes and improvements in upcoming releases. Use with caution in production environments.
+
 ## Key Features
 
 - ⚡ **21% faster** on GPU via multi-tensor operations
