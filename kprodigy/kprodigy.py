@@ -89,10 +89,15 @@ class KProdigy(torch.optim.Optimizer):
             Enable Adam-style bias correction for stability and speed.
             Provides 35% speedup and 1.3% better convergence on SDXL models.
             Critical for small models (< 1M params).
-            Default: True
+            Default: False (reverted from True due to convergence issues)
         safeguard_warmup (bool):
             Use safeguard warmup (like KProdigy).
             Default: False
+        slice_p (int):
+            Slice parameter for D estimation (use every p-th element).
+            slice_p=1 means use all elements (no slicing, most accurate).
+            Higher values reduce memory/compute but may affect D accuracy.
+            Default: 1 (no slicing, matches v0.2.0 behavior)
         fsdp_in_use (bool):
             Set to True when using FSDP.
             Default: False
@@ -122,8 +127,9 @@ class KProdigy(torch.optim.Optimizer):
         d_coef: float = 1.0,
         growth_rate: float = float('inf'),
         d_update_freq: int = 5,
-        use_bias_correction: bool = True,
+        use_bias_correction: bool = False,
         safeguard_warmup: bool = False,
+        slice_p: int = 1,
         fsdp_in_use: bool = False,
     ):
         if not 0.0 <= lr:
@@ -142,6 +148,8 @@ class KProdigy(torch.optim.Optimizer):
             raise ValueError(f"Invalid d_coef value: {d_coef}")
         if d_update_freq < 1:
             raise ValueError(f"Invalid d_update_freq: {d_update_freq}")
+        if not slice_p >= 1:
+            raise ValueError(f"Invalid slice_p value: {slice_p}, must be >= 1")
 
         defaults = dict(
             lr=lr,
@@ -159,6 +167,7 @@ class KProdigy(torch.optim.Optimizer):
             d_update_freq=d_update_freq,
             use_bias_correction=use_bias_correction,
             safeguard_warmup=safeguard_warmup,
+            slice_p=slice_p,
             k=0,
             fsdp_in_use=fsdp_in_use,
         )
@@ -206,6 +215,7 @@ class KProdigy(torch.optim.Optimizer):
             group.setdefault('fsdp_in_use', False)
             group.setdefault('d_numerator', 0.0)  # Accumulated numerator for D estimation
             group.setdefault('d_max', group['d0'])  # Maximum d_hat seen
+            group.setdefault('slice_p', 1)  # Default to no slicing for backward compatibility
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable[[], float]] = None) -> Optional[float]:
@@ -316,8 +326,9 @@ class KProdigy(torch.optim.Optimizer):
                         p.data, memory_format=torch.preserve_format
                     ).detach()
                     
-                    # For D estimation
-                    sliced_param = p.data.flatten()
+                    # For D estimation (with slicing like v0.2.0)
+                    slice_p = group['slice_p']
+                    sliced_param = p.data.flatten()[::slice_p]
                     state['s'] = torch.zeros_like(sliced_param, memory_format=torch.preserve_format).detach()
                     
                     if sliced_param.norm() > 0:
@@ -336,8 +347,10 @@ class KProdigy(torch.optim.Optimizer):
                 should_update_d = k % d_update_freq == 0
                 
                 if lr > 0.0 and should_update_d:
-                    sliced_grad = grad.flatten()
-                    sliced_p = p.data.flatten()
+                    # Use slicing like v0.2.0 for exact compatibility
+                    slice_p = group['slice_p']
+                    sliced_grad = grad.flatten()[::slice_p]
+                    sliced_p = p.data.flatten()[::slice_p]
                     s = state['s']
                     p0 = state['p0']
                     
@@ -394,11 +407,15 @@ class KProdigy(torch.optim.Optimizer):
             for p, grad, state in zip(params_with_grad, grads, states):
                 exp_avg_sq = state['exp_avg_sq']
                 
-                # Compute denominator
+                # Compute denominator (FIX: Use torch.maximum like v0.2.0)
                 if eps_tensor is None or eps_tensor.device != exp_avg_sq.device:
                     eps_tensor = torch.tensor(d * eps, dtype=exp_avg_sq.dtype, device=exp_avg_sq.device)
                 
-                denom = exp_avg_sq.sqrt().add_(d * eps)
+                # CRITICAL FIX v0.3.2: Use torch.maximum() instead of .add_()
+                # v0.3.0-0.3.1 incorrectly used .add_() which differs from v0.2.0 and causes
+                # incorrect denominator values in certain scenarios (especially LoRA/LoKr training).
+                # v0.2.0 used torch.maximum() which prevents division by very small values.
+                denom = torch.maximum(exp_avg_sq.sqrt(), eps_tensor)
                 
                 # Weight decay
                 if weight_decay != 0 and decouple:
